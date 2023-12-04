@@ -42,6 +42,7 @@ def main():
     parser.add_argument('-e', '--evaluate', action='store_true')
     args = parser.parse_args()
 
+    train()
     if args.train:
         train()
 
