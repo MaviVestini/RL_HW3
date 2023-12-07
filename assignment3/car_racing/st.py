@@ -5,95 +5,82 @@ import torch.nn.functional as F
 import numpy as np
 import random
 
-class Critic_Network(nn.Module):
-    def __init__(self, batch_size, device):
-        super(Critic_Network, self).__init__()
-        
-        self.batch_size = batch_size
+class ReplayBuffer:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.buffer = []
+        self.position = 0
+    
+    def push(self, state, action, prob, reward, next_state, done):
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(None)
+        self.buffer[self.position] = (state, action, prob, reward, next_state, done)
+        self.position = int((self.position + 1) % self.capacity)
+    
+    def sample(self, batch_size):
+        batch = random.sample(self.buffer, batch_size)
+        state, action, prob, reward, next_state, done = map(np.stack, zip(*batch))
+        return state, action, prob, reward, next_state, done
+    
+    def __len__(self):
+        return len(self.buffer)
+    
+
+
+
+class Policy_network(nn.Module):
+
+    def __init__(self, device, n_actions, batch_size, lr = 3e-4):
+        super(Policy_network, self).__init__()
         self.device = device
 
-        # Define all the layers 
-        # Convolution since working with image
-        self.conv1 = nn.Conv2d(3, 32, kernel_size = 8, stride = 4)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size = 4, stride = 2)
-        self.conv3 = nn.Conv2d(64, 64, kernel_size = 3, stride = 1)
-
-        # Fully connected layers
-        self.lin1 = nn.Linear(4096, 256)
-        self.lin2 = nn.Linear(256, 1)
-    
-        self.flat = nn.Flatten()
-
-        # Put it all together in sequential
-        self.net = nn.Sequential(self.conv1, nn.ReLU(), self.conv2, nn.ReLU(),
-                                self.conv3, nn.ReLU(), self.flat, self.lin1,
-                                nn.ReLU(), self.lin2).to(device)
-        
-        
-    def forward(self, state):
-        # To apply the network I have to make sure I have torch tensors
-        if state.shape[0] == self.batch_size:
-            state = torch.tensor(state, dtype = torch.float).permute(0,3,1,2)
-        else:
-            state = torch.tensor(state, dtype = torch.float).clone().detach().permute(2, 0, 1).unsqueeze(0)
-        
-        # If possible move to GPU
-        state = state.to(self.device)
-        # Apply the network 
-        state = self.net(state)
-
-        return state.detach().numpy()
-        
-
-class Actor_Network(nn.Module):
-    def __init__(self, batch_size, num_actions, device):
-        super(Actor_Network, self).__init__()
-        
-        self.device = device
-        self.num_actions = num_actions
         self.batch_size = batch_size
 
-        # Define all the layers 
-        # Convolution since working with image
-        self.conv1 = nn.Conv2d(3, 32, kernel_size = 8, stride = 4)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size = 4, stride = 2)
-        self.conv3 = nn.Conv2d(64, 64, kernel_size = 3, stride = 1)
-
-        # Fully connected layers
-        self.lin1 = nn.Linear(4096, 256)
-        self.lin2 = nn.Linear(256, num_actions)
-    
-        self.flat = nn.Flatten()
-
-        # Put it all together in sequential
-        self.net = nn.Sequential(self.conv1, nn.ReLU(), self.conv2, nn.ReLU(),
-                                self.conv3, nn.ReLU(), self.flat, self.lin1,
-                                nn.ReLU(), self.lin2).to(device)
-
-
+        self.actor = nn.Sequential(nn.Conv2d(3, 32, kernel_size = 8, stride = 4),
+                                nn.ReLU(), nn.Conv2d(32, 64, kernel_size = 4, stride = 2),
+                                nn.ReLU(), nn.Conv2d(64, 64, kernel_size = 3, stride = 1),
+                                nn.ReLU(), nn.Flatten(), nn.Linear(4096, 256),
+                                nn.ReLU(), nn.Linear(256, n_actions))
         
+        self.optimizer = torch.optim.Adam(self.parameters(), lr = lr)
+
     def forward(self, state):
-        # To apply the network I have to make sure I have torch tensors
-        if state.shape[0] == self.batch_size:
-            state = torch.tensor(state, dtype = torch.float).permute(0,3,1,2)
-        else:
-            state = torch.tensor(state, dtype = torch.float).clone().permute(2, 0, 1).unsqueeze(0)
-        
-        # If possible move to GPU
-        state = state.to(self.device)
-        # Apply the network 
-        state = self.net(state)
-        return state.detach().numpy()
 
+        x = self.actor(state)
+        x = F.softmax(x, dim=-1)
+        x = torch.distributions.Categorical(x)
+
+        return x
     
     def get_action(self, state):
-        # Apply the netwok
-        state = self.forward(state)
-        # Get the probability for each of the actions
-        probs = F.softmax(torch.tensor(state), dim = -1).detach().numpy()[0]
-        # sample the action
-        action = np.random.choice(range(self.num_actions), 1, p = probs)[0]
+
+        if state.shape[0] != self.batch_size:
+            state = torch.tensor(state, dtype=torch.float).unsqueeze(0).permute(0, 3, 1, 2).to(self.device)
+        else:
+            state = torch.tensor(state, dtype=torch.float).permute(0, 3, 1, 2).to(self.device)
+
+        probs = self.forward(state)
+        
+        action = probs.sample()
         return action
+        
+class Value_network(nn.Module):
+
+    def __init__(self, device, lr = 3e-4):
+        super(Value_network, self).__init__()
+        self.device = device
+
+        self.control = nn.Sequential(nn.Conv2d(3, 32, kernel_size = 8, stride = 4),
+                                nn.ReLU(), nn.Conv2d(32, 64, kernel_size = 4, stride = 2),
+                                nn.ReLU(), nn.Conv2d(64, 64, kernel_size = 3, stride = 1),
+                                nn.ReLU(), nn.Flatten(), nn.Linear(4096, 256),  
+                                nn.ReLU(), nn.Linear(256, 1))
+        
+        self.optimizer = torch.optim.Adam(self.parameters(), lr = lr)
+
+    def forward(self, state):
+        x = self.control(state)
+        return x
 
 
 class Policy(nn.Module):
@@ -103,85 +90,118 @@ class Policy(nn.Module):
         super(Policy, self).__init__()
         self.device = device
         self.env = gym.make('CarRacing-v2', continuous = False)
-        self.num_actions = self.env.action_space.n
 
-        self.lr = 1e-6
-        self.num_iterations = 100
-        self.batch_size = 10
+        self.gamma = 0.99
+        self.policy_clip = 0.2
+        self.batch_size = 64
+        self.N = 64
+        self.n_epochs = 20
+        self.gae_lambda = 0.95
+        self.games = 10
 
-        # Define the networks
-        self.critic = Critic_Network(self.batch_size, device)
-        self.actor = Actor_Network(self.batch_size, self.num_actions, device)
-
-        self.actor_opt = torch.optim.RMSprop(self.actor.parameters(), lr = self.lr)
-        self.critic_opt = torch.optim.RMSprop(self.critic.parameters(), lr = self.lr)
-        
+        self.actor = Policy_network(device, batch_size = self.batch_size, n_actions=5)
+        self.critic = Value_network(device)
+        self.memory = ReplayBuffer(capacity=10000)
 
     def forward(self, x):
         # TODO
-        actor = self.actor(x)
-        critic = self.critic(x)
-        return actor, critic
+        
+        action = self.act(x)
+
+        if x.shape[0] != self.batch_size:
+            x = torch.tensor(x, dtype=torch.float).unsqueeze(0).permute(0, 3, 1, 2).to(self.device)
+        else:
+            x = torch.tensor(x, dtype=torch.float).permute(0, 3, 1, 2).to(self.device)
+
+        policy = self.actor(x)
+        value = self.critic(x)
+        
+        log_prob = torch.squeeze(policy.log_prob(action)).item()
+        action = torch.squeeze(action).item()
+        value = torch.squeeze(value).item()
+
+        return action, value, log_prob
     
     def act(self, state):
         # TODO
-        return self.actor.get_action(state)
+        action = self.actor.get_action(state)
+        return action
+    
+
+    def learn(self):
+        for _ in range(self.n_epochs):
+            
+            states, actions, old_probs, values, rewards, dones = \
+                self.memory.sample(self.batch_size)
+
+            advantages = np.zeros(rewards.shape, dtype=np.float32)
+            print(rewards.shape)
+            for t in range(len(rewards) - 1):
+                discount = 1
+                advantage_t = 0
+                
+                for i in range(t, len(rewards) - 1):
+                    advantage_t += discount*(rewards[i] + self.gamma*values[i+1]*(1-dones[i]) \
+                                            - values[i])
+                    discount *= self.gamma*self.gae_lambda
+
+                advantages[t] = advantage_t
+
+            advantages = torch.tensor(advantages).to(self.actor.device)
+            values = torch.tensor(values).to(self.actor.device)
+
+            new_value = self.critic(states)
+            new_log_prob = self.actor(states)
+            
+            prob_ratio = torch.exp(torch.tensor(new_log_prob - old_probs, dtype= torch.float))
+
+            weights = advantages*prob_ratio
+            clipped_weigths = torch.clamp(prob_ratio, 1-self.policy_clip, 
+                                        1+self.policy_clip)*advantages
+                
+            actor_loss = -torch.min(weights, clipped_weigths).mean()
+
+            returns = advantages + values
+            print(advantages)
+            critic_loss = nn.MSELoss(returns, new_value)
+
+            total_loss = actor_loss + 0.5*critic_loss
+
+            self.actor.optimizer.zero_grad()
+            self.critic.optimizer.zero_grad()
+            total_loss.backward()
+            self.actor.optimizer.step()
+            self.critic.optimizer.step()
+
+
+
+
 
     def train(self):
-        state, _ = self.env.reset()
-        episode_reward = 0
-        losses = []
+        # TODO
+        n_steps = 0
+        for _ in range(self.games):
 
-        for step in range(self.num_iterations):
-
-            actions = np.zeros((self.batch_size,), dtype=np.int32)    
-            states = np.zeros((self.batch_size,) + self.env.observation_space.shape, dtype=float)
-            dones = np.zeros((self.batch_size,), dtype = bool)
-            values = np.zeros((self.batch_size,), dtype = bool)
-            rewards = np.zeros((self.batch_size,), dtype = bool)
-            outputs =  np.zeros((self.batch_size,) + self.env.action_space.shape, dtype=float)
+            state, _ = self.env.reset()
+            done = False
             
-            for episode in range(self.batch_size):
+            while not done:
+                n_steps += 1
 
-                states[episode] = state
-                actions[episode] = self.actor.get_action(state)
-                outputs[episode], values[episode] = self.forward(state)
-                
-                next_state, rewards[episode], dones[episode], truncated, _= self.env.step(actions[episode])
-                #if truncated: print(!!! truncated)
+                action, value, prob = self.forward(state)
+                new_state, reward, done, _, _ = self.env.step(action)
 
-                state = next_state
-                episode_reward += rewards[episode]
-                
-                if dones[episode]:
-                    state = self.env.reset()
-            
+                self.memory.push(state, action, prob, reward, new_state, done)
 
-            _, value_next =  self.forward(state)
-            # Optimizers and losses
-            advantages, returns = self.compute_adv(rewards, values, dones, value_next)
-            print(advantages, returns)
+                if n_steps % self.N == 0:
+                    self.learn()
 
-    
-    def compute_adv(self, rewards, values, dones, value_next, gamma=0.99):
-        values = np.appens(values, value_next)
+                state = new_state
 
-        # Calculate the delta values
-        deltas = [r + (1-done)*gamma*v_next - v for r, v, v_next, done in zip(rewards, values, values[1:], dones)]
-        
-        # Calculate the advantages
-        advantages = np.zeros_like(rewards)
-        adv = 0
-        for i in reversed(range(len(deltas))):
-            adv = deltas[i] + gamma * adv
-            advantages[i] = adv
-            
-        advantages = np.flip(advantages)
-        # Calculate the target values for the value function
-        returns = advantages + values[:-1]
 
-        return advantages, returns
-        
+
+
+        return
 
     def save(self):
         torch.save(self.state_dict(), 'model.pt')

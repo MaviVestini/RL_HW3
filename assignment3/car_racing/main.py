@@ -1,8 +1,8 @@
 import argparse
 import random
 import numpy as np
-#from student import Policy
-from st import Policy
+from new_student import Policy
+#from st import Policy
 import gymnasium as gym
 
 def evaluate(env=None, n_episodes=1, render=False):
@@ -44,6 +44,7 @@ def main():
     args = parser.parse_args()
 
     train()
+    #evaluate(render=True)
     if args.train:
         train()
 

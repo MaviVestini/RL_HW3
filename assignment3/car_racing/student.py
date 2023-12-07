@@ -156,6 +156,8 @@ class Policy(nn.Module):
             advantages[i] = adv
             
         advantages = np.flip(advantages)
+
+        advantages = deltas
         # Calculate the target values for the value function
         returns = advantages + values[:-1]
         
