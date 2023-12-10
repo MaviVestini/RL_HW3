@@ -3,248 +3,269 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-import random
+import torchvision
+from auxiliary import Network, ReplayBuffer
 
-device = 'cpu'
-
-
-class ReplayBuffer:
-        def __init__(self, capacity):
-            self.capacity = capacity
-            self.buffer = []
-            self.position = 0
-        
-        def push(self, state, action, reward, next_state, done, predicted_value, action_output):
-            if len(self.buffer) < self.capacity:
-                self.buffer.append(None)
-            self.buffer[self.position] = (state, action, reward, next_state, done, predicted_value, action_output)
-            self.position = int((self.position + 1) % self.capacity)
-        
-        def sample(self, batch_size):
-            batch = random.sample(self.buffer, batch_size)
-            state, action, reward, next_state, done, predicted_value, action_output = map(np.stack, zip(*batch))
-            return state, action, reward, next_state, done, predicted_value, action_output
-        
-        def __len__(self):
-            return len(self.buffer)
-
-class Critic_Network(nn.Module):
-    def __init__(self, batch_size, device):
-        super(Critic_Network, self).__init__()
-        
-        self.batch_size = batch_size
-        self.device = device
-
-        # Define all the layers 
-        # Convolution since working with image
-        self.conv1 = nn.Conv2d(3, 32, kernel_size = 8, stride = 4)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size = 4, stride = 2)
-        self.conv3 = nn.Conv2d(64, 64, kernel_size = 3, stride = 1)
-
-        # Fully connected layers
-        self.lin1 = nn.Linear(4096, 256)
-        self.lin2 = nn.Linear(256, 1)
-    
-        self.flat = nn.Flatten()
-
-        # Put it all together in sequential
-        self.net = nn.Sequential(self.conv1, nn.ReLU(), self.conv2, nn.ReLU(),
-                                self.conv3, nn.ReLU(), self.flat, self.lin1,
-                                nn.ReLU(), self.lin2).to(device)
-        
-        
-    def forward(self, state):
-        # To apply the network I have to make sure I have torch tensors
-        if state.shape[0] == self.batch_size:
-            state = torch.tensor(state, dtype = torch.float).permute(0,3,1,2)
-        else:
-            state = torch.tensor(state, dtype = torch.float).clone().detach().permute(2, 0, 1).unsqueeze(0)
-        
-        # If possible move to GPU
-        state = state.to(self.device)
-        # Apply the network 
-        state = self.net(state)
-
-        return state
-        
-
-class Actor_Network(nn.Module):
-    def __init__(self, batch_size, num_actions, device):
-        super(Actor_Network, self).__init__()
-        
-        self.device = device
-        self.num_actions = num_actions
-        self.batch_size = batch_size
-
-        # Define all the layers 
-        # Convolution since working with image
-        self.conv1 = nn.Conv2d(3, 32, kernel_size = 8, stride = 4)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size = 4, stride = 2)
-        self.conv3 = nn.Conv2d(64, 64, kernel_size = 3, stride = 1)
-
-        # Fully connected layers
-        self.lin1 = nn.Linear(4096, 256)
-        self.lin2 = nn.Linear(256, num_actions)
-    
-        self.flat = nn.Flatten()
-
-        # Put it all together in sequential
-        self.net = nn.Sequential(self.conv1, nn.ReLU(), self.conv2, nn.ReLU(),
-                                self.conv3, nn.ReLU(), self.flat, self.lin1,
-                                nn.ReLU(), self.lin2).to(device)
-
-
-        
-    def forward(self, state):
-        # To apply the network I have to make sure I have torch tensors
-        if state.shape[0] == self.batch_size:
-            state = torch.tensor(state, dtype = torch.float).permute(0,3,1,2)
-        else:
-            state = torch.tensor(state, dtype = torch.float).clone().permute(2, 0, 1).unsqueeze(0)
-        
-        # If possible move to GPU
-        state = state.to(self.device)
-        # Apply the network 
-        state = self.net(state)
-        return state
-
-    
-    def get_action(self, state):
-        # Apply the netwok
-        state = self.forward(state)
-        # Get the probability for each of the actions
-        probs = F.softmax(state, dim = -1).detach().numpy()[0]
-        # sample the action
-        action = np.random.choice(range(self.num_actions), 1, p = probs)[0]
-        return action
 
 class Policy(nn.Module):
     continuous = False # you can change this
 
     def __init__(self, device=torch.device('cpu')):
         super(Policy, self).__init__()
-        self.device = device
-        self.env = gym.make('CarRacing-v2', continuous = False)
-        self.num_actions = self.env.action_space.n
+        self.device = device        
 
-        self.lr = 1e-6
-        self.num_iterations = 100
-        self.batch_size = 10
+        # Define all the variables
+        self.replay_period = 128
+        self.minibatch = 32
+        self.buffer_size = 10000
+        self.budget = 500_000
 
-        # Define the networks
-        self.critic = Critic_Network(self.batch_size, device)
-        self.actor = Actor_Network(self.batch_size, self.num_actions, device)
+        # Add some exploration/exploitation using epsilon
+        self.epsilon = 1
+        self.epsilon_decay = 0.995
+        self.target_epsilon = 0.01
+        self.use_epsilon = False
 
-        self.actor_opt = torch.optim.RMSprop(self.actor.parameters(), lr = self.lr)
-        self.critic_opt = torch.optim.RMSprop(self.critic.parameters(), lr = self.lr)
+        # Initial exploration don't change epsilon for the first steps
+        self.exploration_start = 25_000
 
-        self.replay_buffer = ReplayBuffer(capacity = 1e5)
+        # For the TD-error
+        self.gamma = 0.9
 
+        # Define the replay buffer
+        self.buffer = ReplayBuffer(self.buffer_size, alpha = 0.7, 
+                                beta = 0.5, batch_size = self.minibatch)
 
-    def calculate_gae(self, rewards, values, dones, value_next, done_next, gamma=0.99):
-        values = np.concatenate((values, value_next.detach().numpy()))
-        dones = np.concatenate((dones, [done_next]))
+        # Define the environment in a discrete space
+        self.env = gym.make('CarRacing-v2', continuous = False)#, render_mode='human')
+        self.n_actions = self.env.action_space.n
 
-        # Calculate the delta values
-        deltas = [r + (1-done)*gamma*v_next - v for r, v, v_next, done in zip(rewards, values, values[1:], dones)]
-        
-        # Calculate the advantages
-        advantages = np.zeros_like(rewards)
-        adv = 0
-        for i in reversed(range(len(deltas))):
-            adv = deltas[i] + gamma * adv
-            advantages[i] = adv
-            
-        advantages = np.flip(advantages)
+        # Keep track of the last 4 frames to stack them together tp use 
+        # as input to the network
+        self.state_stacked = [torch.zeros((84, 84)) for _ in range(4)]
 
-        advantages = deltas
-        # Calculate the target values for the value function
-        returns = advantages + values[:-1]
-        
-        return advantages, returns
+        # Initialize both the target and policy networks
+        self.q_net = Network(output_size=self.n_actions, lr=1e-4)
+        self.target_net = Network(output_size=self.n_actions)
 
-    def optimizers_step(self, batch_size ,gamma=0.99):
-        state, action, reward, next_state, done, value, output = self.replay_buffer.sample(batch_size)
-        
-        # Next step
-        next_action_output, next_value = self.forward(next_state[-1])
-        next_action = self.act(next_state[-1])
-        next_state, next_reward, next_done, truncated, _= self.env.step(next_action)
-        
-        advantages, returns = self.calculate_gae(reward, value, done, next_value, next_done)
-        torch.autograd.set_detect_anomaly(True)
-
-        # Actor
-        self.actor_opt.zero_grad()
-        log_prob = F.log_softmax(torch.tensor(output), dim=-1)
-        loss_actor = -torch.mean(log_prob.T * advantages)
-        print(loss_actor)
-                
-        loss_actor_clone = loss_actor.clone()
-        loss_actor_clone.backward(retain_graph=True)
-        #loss_actor.backward(retain_graph=True )
-        self.actor_opt.step()
-
-        # Critic
-        self.critic_opt.zero_grad()
-        loss_critic = nn.MSELoss()(value.squeeze(), returns.squeeze())
-        loss_critic.backward(retain_graph=True )
-        self.critic_opt.step()
-
-        loss = loss_critic.detach() - loss_actor.detach()
-
-        return float(loss)
-
-
+        # To try and make the problem simpler I'll transform all the images to gray scale
+        self.gray = torchvision.transforms.Compose([torchvision.transforms.ToPILImage(),
+                                                    torchvision.transforms.Grayscale(),
+                                                    torchvision.transforms.ToTensor()])
 
 
     def forward(self, x):
         # TODO
-        actor = self.actor(x)
-        critic = self.critic(x)
-        return actor, critic
+        '''
+        Pass x in the qnetwork and get the output
+        '''
+        predicted_q = self.q_net(x)
+        return predicted_q
     
+
     def act(self, state):
         # TODO
-        return self.actor.get_action(state)
+        '''
+        Given the state choose an action to preform. \n
+        Note that. If we are in the evaluation phase, I don't want to 
+        use epilon but just take the actions from the network, instead if 
+        we are training I want to use epsilon
+        '''
+
+        # If we are not using epsilon this means we are in the evaluation phase
+        # and I need to stack the last frames to have the correct state for 
+        # the network
+        if not self.use_epsilon:
+            # Transform and append
+            self.state_stacked = self.state_stacked[1:] + \
+                                    [self.preprocess_states(state).squeeze()]
+            # Stack into a tensor
+            state = torch.stack(self.state_stacked)
+            # Add batch dimension for the network
+            state = torch.tensor(state).float().unsqueeze(0)
+
+            # take action according to the network
+            predicted_q = self.forward(state)
+            action = torch.argmax(predicted_q).item()
+
+            return action
+
+        # If we are training and I sample a number under epsilon 
+        if np.random.random() < self.epsilon:
+            # take a random action
+            action = np.random.choice(self.n_actions)
+        else:
+            # take action according to the network
+            predicted_q = self.forward(state)
+            action = torch.argmax(predicted_q).item()
+        
+        # return the action
+        return action
+    
+    
+    def preprocess_states(self, state):
+        '''
+        Input: tensor (96,96,3)
+        Output: tensor (1, 84, 84), obtained by changing the image to 
+        black and white and cropping it to take out the bottom part 
+        '''
+        # Crop the bottom of the picture
+        state = state[:84, 6:90,]
+        
+        # Change to black and white
+        b_w = self.gray(state)
+        return b_w
+
+
+    def learn(self, time):
+        '''
+        Function that perform performs the parameters update
+        '''
+        # Get the samples and importance sampling weights
+        samples, weights, sample_idx = self.buffer.get_samples()
+
+        # Extract 
+        state = torch.FloatTensor([sample[0].numpy() for sample in samples])
+        action = torch.tensor([sample[1] for sample in samples], dtype=torch.int64)
+        rewards = torch.FloatTensor([sample[2] for sample in samples])
+        next_state = torch.FloatTensor([sample[3].numpy() for sample in samples])
+        done = torch.IntTensor([sample[4] for sample in samples])
+
+        # TD-error: 
+        # δ_j = R_j + γ_j Qtarget(Sj , argmax_a (Q(S_j, a))) − Q(S_j−1, A_j−1)
+        # Get the outputs for the next_state of both the target and q network 
+        with torch.no_grad():
+            # Output of target given next_states
+            target_output = self.target_net(next_state)
+            # Output of q_network given next_states for argmax_a (Q(S_j, a))if
+            q_output_next = self.forward(state)
+            # Output of q_network given state for Q(S_j−1, A_j−1)
+            forward_output = self.forward(state)
+
+        # Select the action for the target network with the argmax of the q_network
+        actions_for_traget = torch.argmax(q_output_next, dim=1)
+
+        # Qtarget(Sj , argmax_a Q(Sj , a))
+        Q_target = torch.gather(target_output, 1, actions_for_traget.unsqueeze(1))# *(1-done)
+
+        # mask the values corresponding to terminal states
+        mask = 1-done.unsqueeze(1)
+        Q_target = Q_target*mask
+
+        # Q(S_j−1, A_j−1)
+        Q_output =  torch.gather(forward_output, 1, action.unsqueeze(1))
+
+        # Compute the deltas
+        delta = rewards.unsqueeze(1) + self.gamma * Q_target - Q_output
+        
+        # Update the priorities pj ← |δj |
+        priorities = abs(delta.numpy())
+        self.buffer.update_priorities(sample_idx, priorities.reshape(-1) + 1e-6)
+        #print(weights, delta)
+        # Compute the loss and perform Optimizer step
+        loss = torch.mean((weights*delta)**2).requires_grad_(True)
+        self.q_net.optimizer.zero_grad()
+        loss.backward()      
+        self.q_net.optimizer.step()
+        
+        # once every 3 times I compute the loss let's update the target
+        # To finish copy the new network weights to the target one
+        self.target_net.load_state_dict(self.q_net.state_dict())
+    
+        return loss.detach().numpy()
 
     def train(self):
-        state, _ = self.env.reset()
-        episode_reward = 0
-        losses = []
-        for step in range(self.num_iterations):
-            
-            
-            action = self.actor.get_action(state)
-            action_output, predicted_value = self.forward(state)
-            next_state, reward, terminated, truncated, _= self.env.step(action)
-            #if truncated: print(!!! truncated)
-            done = terminated
-            
-            self.replay_buffer.push(state, action, reward, next_state, terminated, 
-                                    predicted_value.reshape(-1).detach().numpy(), 
-                                    action_output.reshape(-1).detach().numpy())
-            
-            if len(self.replay_buffer) > self.batch_size:
-                loss = self.optimizers_step(self.batch_size)
-                print(loss)
-                losses.append(loss)
-                print(losses)
-            
-            state = next_state
-            episode_reward += reward
-            
-            if done:
-                state = self.env.reset()
+        # TODO
+        self.use_epsilon = True
 
+        # Initialize the env
+        self.reset_env()
+
+        # get the initial state by stacking the frames
+        state = torch.stack(self.state_stacked, dim = 0)
+        episode_reward = []
+        loss = []
+
+        # Start the iteration
+        for t in range(self.budget):
+
+            # Select the action 
+            action = self.act(state)
+            # perform the action and orserve the output
+            new_observation, reward, done, truncated, _ = self.env.step(action)
+            episode_reward.append(reward)
+
+            # Given the new observation find the new state
+            self.state_stacked = self.state_stacked[1:] + \
+                            [self.preprocess_states(new_observation).squeeze()]
+            new_state = torch.stack(self.state_stacked, dim = 0)
+
+            # Store everything in the buffer
+            self.buffer.push(state, action, reward, new_state, done)
+
+            # check if it's time to learn
+            if t % (self.replay_period + 1) == 0:
+                loss.append(self.learn(t))
+
+                if t > self.exploration_start:
+                    # The "just use random" initial period is done and I can 
+                    # update epsilon
+                    self.epsilon = max(self.epsilon_decay*self.epsilon, 
+                                    self.target_epsilon)
+            
+
+            if not done and not truncated:
+                state = new_state
+            else:
+                print('reward:', np.sum(episode_reward), 
+                    '|| mean loss:', np.mean(loss), 
+                    '|| epsilon:', self.epsilon, 
+                    '|| steps:', len(episode_reward), 
+                    '|| iteration', t)
+                
+                if np.mean(episode_reward) > 100:
+                    self.save(np.mean(episode_reward))
+
+                # Initialize the env
+                self.reset_env()
+
+                # get the initial state by stacking the frames
+                state = torch.stack(self.state_stacked, dim = 0)
+                episode_reward = []
+                loss = []
+        return
+
+
+    def reset_env(self):
+        '''
+        Reset the environment in case of terminal state and skip the first
+        60 frames since they are just the zoom in part
+        '''
+
+        # Initialize the environment
+        state, _ = self.env.reset() 
+        # List to store the last 4 states since I want to give some temporal 
+        # informations to the network
+        self.state_stacked = []
+
+        # I noticed that the first 50/60 frames are the camera zooming in
+        for i in range(60):
+            # Stay put during the zoom-in phase
+            output = self.env.step(0)
+            # Store the B&W representation of the last 4 frames
+            if i in [56, 57, 58, 59]:
+                self.state_stacked.append(self.preprocess_states(output[0]).squeeze())
         
+        return
 
-    def save(self):
-        torch.save(self.state_dict(), 'model.pt')
 
+
+    
+    def save(self, it = None):
+        if not it: torch.save(self.state_dict(), f'model.pt')
+        else: torch.save(self.state_dict(), f'model_{it}.pt')
     def load(self):
         self.load_state_dict(torch.load('model.pt', map_location=self.device))
-
     def to(self, device):
         ret = super().to(device)
         ret.device = device

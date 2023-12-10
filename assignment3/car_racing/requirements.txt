@@ -4,3 +4,5 @@ gymnasium
 gymnasium[box2d]
 sklearn
 torch
+torchvision==0.16.1
+scikit-learn==1.3.0
