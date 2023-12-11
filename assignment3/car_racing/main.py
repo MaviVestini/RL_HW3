@@ -1,7 +1,7 @@
 import argparse
 import random
 import numpy as np
-from A2C import Policy
+from student import Policy
 import gymnasium as gym
 
 def evaluate(env=None, n_episodes=1, render=False):
@@ -41,7 +41,7 @@ def main():
     parser.add_argument('-t', '--train', action='store_true')
     parser.add_argument('-e', '--evaluate', action='store_true')
     args = parser.parse_args()
-    train()
+    
     if args.train:
         train()
 

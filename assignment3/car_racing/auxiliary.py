@@ -142,7 +142,7 @@ class ReplayBuffer():
         probability = priorities/np.sum(priorities)
 
         # Sample using the computed probabilities
-        sample_idx = np.random.choice(self.position, self.batch_size, replace=True, p = probability)
+        sample_idx = np.random.choice(self.position, self.batch_size, p = probability)
         samples = self.buffer[sample_idx]
         
 

@@ -45,7 +45,7 @@ class Policy(nn.Module):
         self.state_stacked = [torch.zeros((84, 84)) for _ in range(4)]
 
         # Initialize both the target and policy networks
-        self.q_net = Network(output_size=self.n_actions, lr=1e-4)
+        self.q_net = Network(output_size=self.n_actions, lr=1e-5)
         self.target_net = Network(output_size=self.n_actions)
 
         # To try and make the problem simpler I'll transform all the images to gray scale
@@ -111,7 +111,7 @@ class Policy(nn.Module):
         '''
         # Crop the bottom of the picture
         state = state[:84, 6:90,]
-        
+
         # Change to black and white
         b_w = self.gray(state)
         return b_w
@@ -138,7 +138,7 @@ class Policy(nn.Module):
             # Output of target given next_states
             target_output = self.target_net(next_state)
             # Output of q_network given next_states for argmax_a (Q(S_j, a))if
-            q_output_next = self.forward(state)
+            q_output_next = self.forward(next_state)
             # Output of q_network given state for Q(S_j−1, A_j−1)
             forward_output = self.forward(state)
 
@@ -146,7 +146,7 @@ class Policy(nn.Module):
         actions_for_traget = torch.argmax(q_output_next, dim=1)
 
         # Qtarget(Sj , argmax_a Q(Sj , a))
-        Q_target = torch.gather(target_output, 1, actions_for_traget.unsqueeze(1))# *(1-done)
+        Q_target = torch.gather(target_output, 1, actions_for_traget.unsqueeze(1))
 
         # mask the values corresponding to terminal states
         mask = 1-done.unsqueeze(1)
@@ -161,7 +161,7 @@ class Policy(nn.Module):
         # Update the priorities pj ← |δj |
         priorities = abs(delta.numpy())
         self.buffer.update_priorities(sample_idx, priorities.reshape(-1) + 1e-6)
-        #print(weights, delta)
+        
         # Compute the loss and perform Optimizer step
         loss = torch.mean((weights*delta)**2).requires_grad_(True)
         self.q_net.optimizer.zero_grad()
@@ -223,7 +223,7 @@ class Policy(nn.Module):
                     '|| steps:', len(episode_reward), 
                     '|| iteration', t)
                 
-                if np.mean(episode_reward) > 100:
+                if np.sum(episode_reward) > 100:
                     self.save(np.mean(episode_reward))
 
                 # Initialize the env
